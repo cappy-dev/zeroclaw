@@ -793,6 +793,11 @@ pub async fn agent_turn(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    // Authoritative record that `history` carries the synthetic trim
+    // breadcrumb after its leading system messages; kept beside the buffer
+    // instead of being inferred from localized text. Set to true when a trim
+    // path inserts a crumb during the turn.
+    history_has_trim_breadcrumb: &mut bool,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -822,6 +827,7 @@ pub async fn agent_turn(
         config,
         model_provider,
         history,
+        history_has_trim_breadcrumb,
         tools_registry,
         observer,
         provider_name,
@@ -856,6 +862,8 @@ async fn agent_turn_with_sop_reassembly(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    // Authoritative breadcrumb provenance for `history` — see `agent_turn`.
+    history_has_trim_breadcrumb: &mut bool,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -908,6 +916,7 @@ async fn agent_turn_with_sop_reassembly(
     );
     let result = run_tool_call_loop(ToolLoop {
         sop_reassembly,
+        history_has_trim_breadcrumb,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -1893,6 +1902,8 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            // One-shot transcript: no prior trim ran, so no crumb exists.
+            let mut history_has_trim_breadcrumb = false;
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
@@ -1971,6 +1982,7 @@ pub async fn run(
                                     },
                                 ),
                                 history: &mut history,
+                                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
                                 channel_name,
                                 channel_reply_target: None,
                                 cancellation_token: None,
@@ -2184,6 +2196,11 @@ pub async fn run(
             } else {
                 vec![ChatMessage::system(&system_prompt)]
             };
+            // Breadcrumb provenance for `history`, tracked beside the buffer
+            // instead of inferred from localized message text. A session file
+            // written by an earlier runtime cannot vouch for its crumb, so the
+            // record starts fresh with each process.
+            let mut history_has_trim_breadcrumb = false;
 
             loop {
                 print!("> ");
@@ -2531,6 +2548,8 @@ pub async fn run(
                                         },
                                     ),
                                     history: &mut history,
+                                    history_has_trim_breadcrumb:
+                                        &mut history_has_trim_breadcrumb,
                                     channel_name,
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
@@ -2648,6 +2667,7 @@ pub async fn run(
                                         crate::agent::history_trim::breadcrumb(),
                                     );
                                     history = trimmed;
+                                    history_has_trim_breadcrumb = true;
                                     {
                                         let __zc_trim_span = ::zeroclaw_log::info_span!(
                                             target: "zeroclaw_log_internal_scope",
@@ -3332,6 +3352,8 @@ pub async fn process_message(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        // One-shot transcript: no prior trim ran, so no crumb exists.
+        let mut history_has_trim_breadcrumb = false;
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
@@ -3361,6 +3383,7 @@ pub async fn process_message(
                     Some(&config),
                     model_provider.as_ref(),
                     &mut history,
+                    &mut history_has_trim_breadcrumb,
                     &tools_registry,
                     observer.as_ref(),
                     provider_name,
@@ -5218,6 +5241,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -5626,6 +5651,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5704,6 +5731,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5877,6 +5906,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5967,6 +5998,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6042,6 +6075,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6120,6 +6155,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6199,6 +6236,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6265,6 +6304,8 @@ mod tests {
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -6452,6 +6493,8 @@ mod tests {
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -6578,6 +6621,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6656,6 +6701,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6733,6 +6780,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6895,6 +6944,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7037,6 +7088,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7198,6 +7251,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7316,6 +7371,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7489,6 +7546,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: Some(token.clone()),
@@ -7598,6 +7657,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -7691,6 +7752,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -7776,6 +7839,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "lark",
             channel_reply_target: Some("chat-99"),
             cancellation_token: None,
@@ -7869,6 +7934,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "feishu",
             channel_reply_target: Some("chat-77"),
             cancellation_token: None,
@@ -7965,6 +8032,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8067,6 +8136,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8161,6 +8232,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8281,6 +8354,8 @@ mod tests {
                 knobs: &knobs,
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8379,6 +8454,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8482,6 +8559,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8575,6 +8654,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8672,6 +8753,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8771,6 +8854,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8856,6 +8941,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8945,6 +9032,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9029,6 +9118,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9111,6 +9202,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9196,6 +9289,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9279,6 +9374,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9458,6 +9555,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9532,6 +9631,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9607,6 +9708,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9682,6 +9785,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9759,6 +9864,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9840,6 +9947,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9933,6 +10042,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10010,6 +10121,8 @@ Done."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10090,6 +10203,8 @@ Done."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10168,6 +10283,8 @@ Done."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10247,6 +10364,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10383,6 +10502,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10470,6 +10591,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10560,6 +10683,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10673,6 +10798,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10798,6 +10925,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10892,6 +11021,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10997,6 +11128,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11891,6 +12024,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11998,6 +12133,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12102,6 +12239,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12206,6 +12345,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12367,6 +12508,8 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12456,6 +12599,7 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12530,6 +12674,7 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12661,6 +12806,7 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12742,6 +12888,7 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -15036,6 +15183,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15220,6 +15369,8 @@ Let me check the result."#;
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15346,6 +15497,8 @@ Let me check the result."#;
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15464,6 +15617,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15584,6 +15739,8 @@ Let me check the result."#;
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15678,6 +15835,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15769,6 +15928,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17247,6 +17408,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17415,6 +17578,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17617,6 +17782,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17717,6 +17884,8 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17846,6 +18015,7 @@ Let me check the result."#;
             ChatMessage::system("system"),
             ChatMessage::user("run the tool once"),
         ];
+        let mut test_crumb_present = false;
         let tool_calls = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
             "count_tool",
@@ -17892,6 +18062,7 @@ Let me check the result."#;
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                history_has_trim_breadcrumb: &mut test_crumb_present,
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -17948,6 +18119,208 @@ Let me check the result."#;
     }
 
     #[tokio::test]
+    async fn stateful_varying_growth_hook_surfaces_oversized_second_request() {
+        // A STATEFUL `before_llm_call` hook whose growth varies by iteration:
+        // it adds nothing to the first request and a materially large message
+        // to the second. The pre-dispatch gate measures the EXACT population
+        // about to be sent at each seam; the second dispatch must therefore
+        // surface the explicit unsatisfiable-floor outcome instead of passing
+        // silently, and the captured provider request must contain the
+        // hook-added content (the gate measured the real request, not a
+        // projection).
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct GrowOnSecondCall(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for GrowOnSecondCall {
+            fn name(&self) -> &str {
+                "grow-on-second-call"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    messages.push(ChatMessage::assistant("y".repeat(30_000)));
+                }
+                HookResult::Continue(())
+            }
+        }
+
+        #[derive(Default)]
+        struct CapturingProvider {
+            requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                let count = self.requests.lock().unwrap().len();
+                let text = if count == 1 {
+                    r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+                } else {
+                    "done"
+                };
+                Ok(ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapturingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingProvider"
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(GrowOnSecondCall(Arc::clone(&hook_calls))));
+
+        let provider = CapturingProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let mut crumb_present = false;
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&tool_calls),
+        ))];
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: Some(&hooks),
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Tight enough that the second request's hook-grown
+                    // population exceeds it, but comfortable for the first.
+                    context_token_budget: 2_000,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+            }),
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            2,
+            "two iterations must dispatch two requests"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !captured[0].iter().any(|content| content.starts_with("yyy")),
+            "the first request must not carry the hook growth"
+        );
+        assert!(
+            captured[1].iter().any(|content| content.starts_with("yyy")),
+            "the captured SECOND request must contain the stateful hook's growth"
+        );
+
+        let mut saw_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor: Some(true),
+                token_budget: Some(2_000),
+                ..
+            } = event
+            {
+                saw_floor = true;
+            }
+        }
+        assert!(
+            saw_floor,
+            "the oversized second dispatch must emit the explicit floor outcome"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_turn_propagates_resolved_agent_alias_to_observer_events() {
         // Regression guard: process_message resolves agent_alias but
         // agent_turn hardcoded `agent_alias: None` in the ToolLoop it built,
@@ -17973,6 +18346,7 @@ Let me check the result."#;
             None,
             &model_provider,
             &mut history,
+            &mut false,
             &tools_registry,
             observer.as_ref(),
             "mock-provider",
@@ -18027,6 +18401,7 @@ Let me check the result."#;
             None, // config: configless test
             &model_provider,
             &mut history,
+            &mut false,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",
@@ -18098,6 +18473,7 @@ Let me check the result."#;
             None, // config
             &model_provider,
             &mut history,
+            &mut false,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",
