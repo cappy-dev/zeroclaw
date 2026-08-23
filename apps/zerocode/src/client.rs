@@ -300,6 +300,10 @@ pub enum SessionUpdate {
         tokens_before_source: Option<String>,
         /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
         tokens_after_source: Option<String>,
+        /// The retained request cannot fit the configured budget (protected
+        /// newest turn plus schemas) even after trimming. Absent for ordinary
+        /// trims; authoritative floor signal — not `dropped_messages == 0`.
+        unsatisfiable_floor: Option<bool>,
     },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
@@ -409,6 +413,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .get("tokens_after_source")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -6449,6 +6454,7 @@ mod plan_parse_tests {
                 tokens_after: None,
                 tokens_before_source: None,
                 tokens_after_source: None,
+                unsatisfiable_floor: None,
             }) if session_id == "sess-3" && reason == "history message limit exceeded"
         ));
     }
@@ -6480,6 +6486,7 @@ mod plan_parse_tests {
                 tokens_after: Some(117000),
                 tokens_before_source: Some(source),
                 tokens_after_source: Some(after_source),
+                unsatisfiable_floor: None,
             }) if session_id == "sess-4"
                 && reason == "context token budget exceeded"
                 && source == "provider"
