@@ -319,9 +319,11 @@ impl AcpSessionStore {
     /// `trim_breadcrumb` column existed (`NULL`): infer provenance from
     /// whether the first non-system message is exactly the canonical
     /// breadcrumb text. A genuine user turn that happens to equal that text
-    /// is misclassified on this one-time migration only; the next explicit
-    /// write (`set_trim_breadcrumb`) replaces the inferred value with a
-    /// recorded one. This mirrors the JSONL interactive-session migration in
+    /// is misclassified on this one-time migration only; callers must
+    /// persist the result via `record_inferred_trim_breadcrumb` so the
+    /// column stops being `NULL` and later restores read the recorded fact
+    /// instead of re-inferring it from message text on every load. This
+    /// mirrors the JSONL interactive-session migration in
     /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`,
     /// restricted to the locale-independent canonical string because this
     /// crate sits below the runtime i18n layer.
@@ -335,6 +337,25 @@ impl AcpSessionStore {
             .is_some_and(|first| {
                 first.role == "user" && first.content == HISTORY_TRIM_BREADCRUMB_CANONICAL
             })
+    }
+
+    /// Write the one-time `infer_legacy_trim_breadcrumb` result back to the
+    /// still-`NULL` column, using the connection the caller already holds
+    /// (avoids re-locking `self.conn`, which the caller's `load_session*`
+    /// query has open). After this, the column is no longer `NULL` for this
+    /// session, so the next restore reads the recorded fact rather than
+    /// inferring it again from user-controlled text.
+    fn record_inferred_trim_breadcrumb(
+        conn: &Connection,
+        session_uuid: &str,
+        inferred: bool,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE session_uuid = ?2",
+            params![i64::from(inferred), session_uuid],
+        )
+        .context("Failed to record inferred legacy trim_breadcrumb")?;
+        Ok(())
     }
 
     /// Record a new session. Returns the integer `id` assigned by SQLite.
@@ -439,9 +460,14 @@ impl AcpSessionStore {
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
         let messages = Self::load_messages(&conn, session_id)?;
-        let trim_breadcrumb = trim_breadcrumb_raw
-            .map(|v| v != 0)
-            .unwrap_or_else(|| Self::infer_legacy_trim_breadcrumb(&messages));
+        let trim_breadcrumb = match trim_breadcrumb_raw {
+            Some(v) => v != 0,
+            None => {
+                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
+                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
+                inferred
+            }
+        };
 
         Ok(Some(AcpSessionData {
             session_uuid: session_uuid.to_string(),
@@ -504,9 +530,14 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
-        let trim_breadcrumb = trim_breadcrumb_raw
-            .map(|v| v != 0)
-            .unwrap_or_else(|| Self::infer_legacy_trim_breadcrumb(&messages));
+        let trim_breadcrumb = match trim_breadcrumb_raw {
+            Some(v) => v != 0,
+            None => {
+                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
+                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
+                inferred
+            }
+        };
 
         Ok(AcpSessionRestore::Restorable(AcpSessionData {
             session_uuid: session_uuid.to_string(),
@@ -1233,6 +1264,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         (tmp, store)
+    }
+
+    /// Read the raw `trim_breadcrumb` column, bypassing the inference
+    /// fallback, so a test can tell `NULL` (never recorded) apart from an
+    /// explicit `0`/`1`.
+    fn raw_trim_breadcrumb_column(store: &AcpSessionStore, session_uuid: &str) -> Option<i64> {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT trim_breadcrumb FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -2044,6 +2090,12 @@ mod tests {
             "a NULL (legacy) row with a leading canonical marker must be \
              inferred as carrying the breadcrumb"
         );
+        assert_eq!(
+            raw_trim_breadcrumb_column(&store, "sess-legacy-marker"),
+            Some(1),
+            "the one-time inference must be recorded back to the column, \
+             not re-inferred from text on every restore"
+        );
 
         // A genuine colliding user turn (no synthetic marker at all) must
         // NOT be misclassified when the column is legacy-NULL either.
@@ -2075,6 +2127,12 @@ mod tests {
         assert!(
             !restored_clean.trim_breadcrumb,
             "a legacy-NULL row with no marker-shaped text must not be inferred as true"
+        );
+        assert_eq!(
+            raw_trim_breadcrumb_column(&store, "sess-legacy-no-marker"),
+            Some(0),
+            "the one-time inference must be recorded back to the column even \
+             when it infers false, not left NULL to be re-inferred later"
         );
     }
 

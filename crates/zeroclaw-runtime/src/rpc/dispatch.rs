@@ -2721,7 +2721,9 @@ impl RpcDispatcher {
                     // already trimmed underneath it.
                     let agent = agent.lock().await;
                     let durable = zeroclaw_providers::durable_chat_messages(agent.history());
-                    let _ = backend.replace_conversation_state(
+                    replace_rpc_chat_conversation_state(
+                        backend.as_ref(),
+                        sid,
                         &key,
                         &durable,
                         agent.history_has_trim_breadcrumb(),
@@ -5861,6 +5863,33 @@ fn notification_for_turn_event(
     serde_json::to_string(&n).ok()
 }
 
+/// Replace the RPC chat session's durable transcript and breadcrumb flag
+/// with the agent's own authoritative post-turn history. A durable write
+/// failure here must not be silently swallowed: the turn is still reported
+/// to the RPC client as completed, but the durable store then disagrees
+/// with what the caller claims was persisted, so failures are logged with
+/// session context for operators to notice.
+fn replace_rpc_chat_conversation_state(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_id: &str,
+    session_key: &str,
+    durable: &[zeroclaw_providers::ChatMessage],
+    breadcrumb_present: bool,
+) {
+    if let Err(e) = backend.replace_conversation_state(session_key, durable, breadcrumb_present) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "error": format!("{}", e),
+                })),
+            "Failed to persist authoritative post-turn conversation state"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod connection_test_support {
     use super::RpcContext;
@@ -6059,6 +6088,53 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    /// A backend whose durable replacement always fails, standing in for a
+    /// disk or other operational failure at the RPC chat persistence
+    /// boundary.
+    struct FailingReplaceBackend;
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingReplaceBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn rewrite_messages(
+            &self,
+            _session_key: &str,
+            _messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "simulated durable replacement failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn replace_rpc_chat_conversation_state_logs_and_does_not_panic_on_durable_failure() {
+        // The RPC chat completion path must not crash or hang when the
+        // durable replacement fails; it logs and returns so the turn's
+        // completion notification still reaches the client. There is no
+        // return value to assert on directly (the caller's contract is
+        // "best-effort, logged"), so this pins that the call completes
+        // without panicking against a backend that always fails the write.
+        let backend = FailingReplaceBackend;
+        let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
+
+        replace_rpc_chat_conversation_state(&backend, "sess-1", "rpc_sess-1", &durable, false);
     }
 
     #[test]

@@ -941,16 +941,33 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
 /// turn starting and this post-turn persistence — in which case the
 /// `aborted` / `done` / `error` frames are still sent to the client, but the
 /// row `DELETE /api/sessions/{id}` just wiped is not re-created.
+///
+/// Returns `false` when the durable write itself failed (logged with session
+/// context), so the caller does not report the turn as durably persisted
+/// when the store disagrees.
 fn replace_conversation_state_unless_deleted(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     durable: &[zeroclaw_providers::ChatMessage],
     breadcrumb_present: bool,
-) {
+) -> bool {
     if !backend.session_exists(session_key) {
-        return;
+        return true;
     }
-    let _ = backend.replace_conversation_state(session_key, durable, breadcrumb_present);
+    if let Err(e) = backend.replace_conversation_state(session_key, durable, breadcrumb_present) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "error": format!("{}", e),
+                })),
+            "Failed to persist authoritative post-turn conversation state"
+        );
+        return false;
+    }
+    true
 }
 
 /// Replace the session's durable transcript and breadcrumb flag with the
@@ -963,14 +980,14 @@ fn persist_agent_conversation_state(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     agent: &zeroclaw_runtime::agent::Agent,
-) {
+) -> bool {
     let durable = zeroclaw_providers::durable_chat_messages(agent.history());
     replace_conversation_state_unless_deleted(
         backend,
         session_key,
         &durable,
         agent.history_has_trim_breadcrumb(),
-    );
+    )
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -2693,6 +2710,59 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .map(|m| m.content.clone())
                 .collect::<Vec<_>>(),
             "replacement must durably overwrite the stale transcript, not silently no-op"
+        );
+    }
+
+    /// A backend whose durable replacement always fails, standing in for a
+    /// disk or other operational failure at the WebSocket persistence
+    /// boundary.
+    struct FailingReplaceBackend;
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingReplaceBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            // Unlike `DeletedSessionBackend`, this session is still live;
+            // only the durable write itself fails.
+            true
+        }
+        fn rewrite_messages(
+            &self,
+            _session_key: &str,
+            _messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "simulated durable replacement failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn replace_conversation_state_unless_deleted_reports_durable_failure() {
+        // The WebSocket completion path must not claim the turn's history
+        // was durably persisted when the backend actually failed the write:
+        // the caller uses this to decide whether the authoritative-history
+        // guarantee held for this turn.
+        let backend = FailingReplaceBackend;
+        let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
+
+        assert!(
+            !replace_conversation_state_unless_deleted(&backend, "gw_failing", &durable, false),
+            "a failed durable replacement must be reported to the caller, not swallowed"
         );
     }
 

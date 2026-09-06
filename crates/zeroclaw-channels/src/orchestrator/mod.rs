@@ -2442,12 +2442,21 @@ fn strip_volatile_preamble_before_persist(
 /// persist lock so the transcript and its provenance cannot observably
 /// diverge. Callers append this turn's own new tool/assistant messages
 /// afterward, so this only resyncs the base the loop actually trimmed.
+///
+/// Returns `true` once the durable write (if any) has succeeded and the
+/// in-memory cache now matches `trimmed_turns`. Returns `false` when a
+/// session store is configured but `replace_conversation_state` failed; the
+/// cache is left untouched in that case so it keeps agreeing with the
+/// last-known-good durable transcript instead of running ahead of it — a
+/// later restart and the live process would otherwise disagree about which
+/// turns exist. The caller is responsible for not treating the turn as
+/// converged when this returns `false`.
 fn resync_sender_history_after_trim(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
     trimmed_turns: &[ChatMessage],
     breadcrumb_present: bool,
-) {
+) -> bool {
     let persist_lock = acquire_persist_lock(ctx, sender_key);
     let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -2460,7 +2469,7 @@ fn resync_sender_history_after_trim(
         // is atomic on backends that can make it so (SQLite) and otherwise
         // serializes both writes under this same lock, so a failure here
         // cannot desynchronize the pair — the in-memory cache below is only
-        // updated once we know which (if either) durable state applies.
+        // updated once we know the durable write actually applied.
         if let Err(e) =
             store.replace_conversation_state(sender_key, trimmed_turns, breadcrumb_present)
         {
@@ -2471,6 +2480,7 @@ fn resync_sender_history_after_trim(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Failed to persist trimmed session history and breadcrumb provenance"
             );
+            return false;
         }
     }
 
@@ -2479,6 +2489,7 @@ fn resync_sender_history_after_trim(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     histories.put(sender_key.to_string(), trimmed_turns.to_vec());
+    true
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
@@ -7540,12 +7551,26 @@ async fn process_channel_message_body(
             retained_prior_turns,
             outgoing_user_turn_raw_content.as_deref(),
         );
-        resync_sender_history_after_trim(
+        let resynced = resync_sender_history_after_trim(
             ctx.as_ref(),
             &history_key,
             &clean_retained_turns,
             history_has_trim_breadcrumb,
         );
+        if !resynced {
+            // The durable write failed, so the cache still holds the
+            // pre-trim transcript. Revert the in-memory breadcrumb flag we
+            // set above to match: otherwise the next turn's
+            // `append_sender_turn` would build on the stale pre-trim cache
+            // while `history_crumb_flags` claims the trim already landed,
+            // and a later restore could re-infer a breadcrumb that was
+            // never actually persisted.
+            let mut flags = ctx
+                .history_crumb_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            flags.put(history_key.clone(), crumb_present_before_loop);
+        }
     }
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
@@ -14188,7 +14213,10 @@ fn channel_trim_resync_survives_restart() {
     // The tool-call loop trimmed its own working buffer: the two old turns
     // are gone and a breadcrumb was inserted ahead of the retained turn.
     let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
-    resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true);
+    assert!(
+        resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true),
+        "resync must report success when the durable write succeeds"
+    );
 
     // The in-memory cache must reflect the trim immediately.
     let cached = ctx
@@ -14306,15 +14334,33 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
         .set_session_trim_breadcrumb(&sender, false)
         .expect("seed the pre-trim flag");
 
+    let pre_trim_turn = ChatMessage::user("pre-trim turn that must survive the failed resync");
+    backend
+        .append(&sender, &pre_trim_turn)
+        .expect("seed pre-trim durable turn");
+
     let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![pre_trim_turn.clone()]);
+
     let trimmed_turns = vec![
         ChatMessage::system("(earlier history was trimmed)"),
         ChatMessage::user("most recent turn"),
     ];
 
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
     // The transcript write fails; this must not proceed to write a new
-    // breadcrumb flag describing a transcript that was never committed.
-    resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true);
+    // breadcrumb flag describing a transcript that was never committed, and
+    // must not publish the trimmed cache either.
+    assert!(
+        !resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true),
+        "resync must report failure when the durable transcript write fails"
+    );
 
     assert_eq!(
         backend
@@ -14323,6 +14369,37 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
         Some(false),
         "the pre-trim flag must be left in place when the transcript write fails, \
          not overwritten with a value describing an uncommitted transcript"
+    );
+
+    // The in-memory cache must still agree with the durable pre-trim state,
+    // not the trimmed turns that never actually landed.
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == 1 && same(&cached[0], &pre_trim_turn),
+        "the cache must not publish the trimmed turns when the durable write failed"
+    );
+
+    // A later message appended through the ordinary path must build on the
+    // last-known-good durable base, so the live cache and a reload agree.
+    backend
+        .append(&sender, &ChatMessage::user("turn after the failed resync"))
+        .expect("append after failed resync");
+    let reloaded = backend.load(&sender);
+    assert_eq!(
+        reloaded.len(),
+        2,
+        "a restart must see the pre-trim turn plus the newly appended turn, \
+         not the trimmed transcript that was never durably committed"
+    );
+    assert!(
+        same(&reloaded[0], &pre_trim_turn),
+        "the pre-trim turn must survive the failed resync across a restart"
     );
 }
 

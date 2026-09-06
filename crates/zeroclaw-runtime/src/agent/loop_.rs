@@ -5851,6 +5851,8 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcript starts fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
