@@ -2443,22 +2443,48 @@ fn strip_volatile_preamble_before_persist(
 /// diverge. Callers append this turn's own new tool/assistant messages
 /// afterward, so this only resyncs the base the loop actually trimmed.
 ///
+/// `known_prefix_len` is the cache length this turn observed right after
+/// appending its own inbound message, before the tool loop ran. Without
+/// `interrupt_on_new_message`, another worker for the same `sender_key` can
+/// run concurrently and append its own complete turn under this same lock
+/// while this turn's loop is still in flight. If the live cache has grown
+/// past `known_prefix_len` by the time this call takes the lock, that
+/// worker's turns are appended after `trimmed_turns` instead of being
+/// silently discarded by a wholesale replace.
+///
 /// Returns `true` once the durable write (if any) has succeeded and the
-/// in-memory cache now matches `trimmed_turns`. Returns `false` when a
-/// session store is configured but `replace_conversation_state` failed; the
-/// cache is left untouched in that case so it keeps agreeing with the
-/// last-known-good durable transcript instead of running ahead of it — a
-/// later restart and the live process would otherwise disagree about which
-/// turns exist. The caller is responsible for not treating the turn as
-/// converged when this returns `false`.
+/// in-memory cache and `history_crumb_flags` now match the published state.
+/// Returns `false` when a session store is configured but
+/// `replace_conversation_state` failed. `replace_conversation_state` may
+/// have partially applied (e.g. a JSONL transcript rewrite that lands before
+/// a breadcrumb sidecar write fails), so on failure this reloads whatever is
+/// actually durable now and publishes that to both the cache and
+/// `history_crumb_flags` — falling back to `crumb_present_before_loop` only
+/// when the backend has no breadcrumb recorded at all — rather than leaving
+/// the cache ahead of, or behind, the real durable state.
 fn resync_sender_history_after_trim(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
     trimmed_turns: &[ChatMessage],
     breadcrumb_present: bool,
+    known_prefix_len: usize,
+    crumb_present_before_loop: bool,
 ) -> bool {
     let persist_lock = acquire_persist_lock(ctx, sender_key);
     let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut published_turns = trimmed_turns.to_vec();
+    {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = histories.peek(sender_key)
+            && live.len() > known_prefix_len
+        {
+            published_turns.extend_from_slice(&live[known_prefix_len..]);
+        }
+    }
 
     if let Some(ref store) = ctx.session_store {
         // One call, not two independent best-effort writes: if the transcript
@@ -2467,11 +2493,12 @@ fn resync_sender_history_after_trim(
         // if the flag write failed after the transcript succeeded, a restart
         // could re-infer provenance from text. `replace_conversation_state`
         // is atomic on backends that can make it so (SQLite) and otherwise
-        // serializes both writes under this same lock, so a failure here
-        // cannot desynchronize the pair — the in-memory cache below is only
-        // updated once we know the durable write actually applied.
+        // serializes both writes under this same lock. A failure can still
+        // mean the transcript half landed and the breadcrumb half did not
+        // (or vice versa), so on error we reload the backend's actual
+        // current state below instead of assuming nothing changed.
         if let Err(e) =
-            store.replace_conversation_state(sender_key, trimmed_turns, breadcrumb_present)
+            store.replace_conversation_state(sender_key, &published_turns, breadcrumb_present)
         {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2480,6 +2507,23 @@ fn resync_sender_history_after_trim(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Failed to persist trimmed session history and breadcrumb provenance"
             );
+            let reloaded_turns = store.load(sender_key);
+            let reloaded_breadcrumb = store
+                .get_session_trim_breadcrumb(sender_key)
+                .ok()
+                .flatten()
+                .unwrap_or(crumb_present_before_loop);
+            let mut histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            histories.put(sender_key.to_string(), reloaded_turns);
+            drop(histories);
+            let mut flags = ctx
+                .history_crumb_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            flags.put(sender_key.to_string(), reloaded_breadcrumb);
             return false;
         }
     }
@@ -2488,7 +2532,13 @@ fn resync_sender_history_after_trim(
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    histories.put(sender_key.to_string(), trimmed_turns.to_vec());
+    histories.put(sender_key.to_string(), published_turns);
+    drop(histories);
+    let mut flags = ctx
+        .history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    flags.put(sender_key.to_string(), breadcrumb_present);
     true
 }
 
@@ -7551,26 +7601,18 @@ async fn process_channel_message_body(
             retained_prior_turns,
             outgoing_user_turn_raw_content.as_deref(),
         );
-        let resynced = resync_sender_history_after_trim(
+        // `resync_sender_history_after_trim` reconciles both the cache and
+        // `history_crumb_flags` to whatever ends up durable: the intended
+        // trimmed state on success, or a reload of the backend's actual
+        // current state on failure. Nothing further to revert here.
+        resync_sender_history_after_trim(
             ctx.as_ref(),
             &history_key,
             &clean_retained_turns,
             history_has_trim_breadcrumb,
+            prior_turns_len_before_loop,
+            crumb_present_before_loop,
         );
-        if !resynced {
-            // The durable write failed, so the cache still holds the
-            // pre-trim transcript. Revert the in-memory breadcrumb flag we
-            // set above to match: otherwise the next turn's
-            // `append_sender_turn` would build on the stale pre-trim cache
-            // while `history_crumb_flags` claims the trim already landed,
-            // and a later restore could re-infer a breadcrumb that was
-            // never actually persisted.
-            let mut flags = ctx
-                .history_crumb_flags
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            flags.put(history_key.clone(), crumb_present_before_loop);
-        }
     }
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
@@ -14214,7 +14256,7 @@ fn channel_trim_resync_survives_restart() {
     // are gone and a breadcrumb was inserted ahead of the retained turn.
     let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
     assert!(
-        resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true),
+        resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true, 3, false),
         "resync must report success when the durable write succeeds"
     );
 
@@ -14358,7 +14400,7 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
     // breadcrumb flag describing a transcript that was never committed, and
     // must not publish the trimmed cache either.
     assert!(
-        !resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true),
+        !resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true, 1, false),
         "resync must report failure when the durable transcript write fails"
     );
 
@@ -14400,6 +14442,101 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
     assert!(
         same(&reloaded[0], &pre_trim_turn),
         "the pre-trim turn must survive the failed resync across a restart"
+    );
+}
+
+/// With `interrupt_on_new_message` disabled, two workers for the same sender
+/// can run concurrently. If a second worker completes a full turn (via the
+/// ordinary `append_sender_turn` path) after the first worker snapshotted its
+/// history but before the first worker's post-trim resync takes the persist
+/// lock, the resync must not wipe out the second worker's turns with its own
+/// stale, loop-owned trimmed snapshot.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "concurrent_resync_test_key".to_string();
+
+    let dropped_turn = ChatMessage::user("old turn worker A is about to trim away");
+    let retained_turn = ChatMessage::user("recent turn worker A retains");
+    backend.append(&sender, &dropped_turn).expect("seed append");
+    backend
+        .append(&sender, &retained_turn)
+        .expect("seed append");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            sender.clone(),
+            vec![dropped_turn.clone(), retained_turn.clone()],
+        );
+
+    // Worker A observes this two-turn cache right after appending its own
+    // inbound message, before its tool loop runs.
+    let known_prefix_len = 2;
+
+    // Worker B, for the same sender, runs concurrently and completes a full
+    // turn — its own inbound message plus the assistant's reply — through
+    // the ordinary append path before worker A's resync takes the lock.
+    let worker_b_user = ChatMessage::user("worker B's own inbound message");
+    let worker_b_reply = ChatMessage::assistant("worker B's completed reply");
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_user.clone());
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_reply.clone());
+
+    // Worker A's tool loop trimmed the old turn and inserted a breadcrumb in
+    // its own working buffer, unaware that worker B already appended turns.
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    assert!(
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            known_prefix_len,
+            false,
+        ),
+        "resync must report success when the durable write succeeds"
+    );
+
+    let expected = [
+        breadcrumb.clone(),
+        retained_turn.clone(),
+        worker_b_user.clone(),
+        worker_b_reply.clone(),
+    ];
+
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the resync must append worker A's trimmed prefix ahead of worker B's turns, \
+         not discard worker B's completed turn: got {cached:?}"
+    );
+
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the durable transcript must agree with the cache after the merge, \
+         so a restart does not lose worker B's turn either: got {reloaded:?}"
     );
 }
 
