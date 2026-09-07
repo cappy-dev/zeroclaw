@@ -612,11 +612,17 @@ impl AcpSessionStore {
     }
 
     fn load_messages(conn: &Connection, session_id: i64) -> Result<Vec<ConversationMessage>> {
-        // Pull all message rows.
+        // Pull all message rows, excluding any `system` row. `insert_messages`
+        // has never written one since the write-path filter that keeps the
+        // Agent's system prompt out of authoritative replacements, but a
+        // database created before that fix can still have one on disk;
+        // filtering here is defense in depth so a restored session or a
+        // `session/messages` read can't re-expose it even if a write path
+        // regresses or an old row survives a partial migration.
         let mut msg_stmt = conn
             .prepare(
                 "SELECT id, role, content, reasoning_content
-                 FROM acp_messages WHERE session_id = ?1 ORDER BY id ASC",
+                 FROM acp_messages WHERE session_id = ?1 AND role != 'system' ORDER BY id ASC",
             )
             .context("Failed to prepare message query")?;
 
@@ -1579,6 +1585,63 @@ mod tests {
             data.messages.len(),
             2,
             "append_turn must skip system rows too"
+        );
+    }
+
+    #[test]
+    fn load_session_filters_a_legacy_system_row_written_before_the_write_path_fix() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-legacy-system", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy-system",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+
+        // Simulate a row written before `insert_messages` filtered system
+        // rows: insert one directly, bypassing every write path.
+        {
+            let conn = store.conn.lock();
+            let session_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                    params!["sess-legacy-system"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO acp_messages (session_id, role, content, created_at)
+                 VALUES (?1, 'system', 'legacy stored prompt', '2020-01-01T00:00:00Z')",
+                params![session_id],
+            )
+            .unwrap();
+        }
+
+        let data = store.load_session("sess-legacy-system").unwrap().unwrap();
+        assert!(
+            data.messages
+                .iter()
+                .all(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system")),
+            "a legacy system row must not reach session/messages output even though \
+             it predates the write-path filter: {:?}",
+            data.messages
+        );
+
+        let restored = store
+            .load_session_for_restore("sess-legacy-system")
+            .unwrap();
+        let AcpSessionRestore::Restorable(restored) = restored else {
+            panic!("expected a restorable session");
+        };
+        assert!(
+            restored
+                .messages
+                .iter()
+                .all(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system")),
+            "restore must not resurrect a legacy system row into the Agent's history either"
         );
     }
 

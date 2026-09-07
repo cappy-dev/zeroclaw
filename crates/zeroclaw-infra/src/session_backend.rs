@@ -244,8 +244,15 @@ pub trait SessionBackend: Send + Sync {
     /// store's mutation guard) so concurrent turns cannot interleave, but the
     /// pair is not crash-atomic. A crash between the two writes can leave
     /// transcript and flag temporarily out of sync, recoverable on the next
-    /// trim. Backends that can provide a transaction (e.g. SQLite) should
-    /// override this to make the pair atomic.
+    /// trim. Both built-in backends override this with a stronger guarantee:
+    /// `SqliteSessionBackend` makes the pair atomic inside one transaction,
+    /// and the JSONL `SessionStore` rolls the transcript back to its
+    /// pre-replace content when the breadcrumb write fails, so an in-process
+    /// failure converges back to the last known-good pair instead of leaving
+    /// a new transcript paired with a stale flag (a process crash between the
+    /// two file writes can still split them, since JSONL uses two files).
+    /// Backends that can provide a transaction should follow SQLite's
+    /// example; ones limited to independent writes should follow JSONL's.
     fn replace_conversation_state(
         &self,
         session_key: &str,

@@ -225,6 +225,41 @@ impl SqliteSessionBackend {
         Ok(())
     }
 
+    fn rewrite_messages_on(
+        conn: &Connection,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for message in messages {
+            Self::append_on(conn, session_key, message, &now)?;
+        }
+        conn.execute(
+            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
+            params![session_key, messages.len() as i64],
+        )?;
+        Ok(())
+    }
+
+    fn set_session_trim_breadcrumb_on(
+        conn: &Connection,
+        session_key: &str,
+        present: bool,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, trim_breadcrumb)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET trim_breadcrumb = excluded.trim_breadcrumb",
+            params![session_key, now, now, i64::from(present)],
+        )?;
+        Ok(())
+    }
+
     fn source_fingerprint(path: &Path, name: &str) -> Result<(String, i64)> {
         let mut file = std::fs::File::open(path)
             .with_context(|| format!("Failed to open JSONL session {name}"))?;
@@ -844,20 +879,29 @@ impl SessionBackend for SqliteSessionBackend {
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
-        tx.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
-        let now = Utc::now().to_rfc3339();
-        for message in messages {
-            Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
-        }
-        tx.execute(
-            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
-            params![session_key, messages.len() as i64],
-        )
-        .map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Replace the transcript and the breadcrumb flag in one transaction, so
+    /// the pair can never commit as a partial write: a crash or error
+    /// between the two rolls the whole transaction back rather than leaving
+    /// a new transcript paired with a stale flag (or vice versa). The
+    /// default `SessionBackend::replace_conversation_state` performs these
+    /// as two separate committed operations; this override replaces it for
+    /// SQLite where a single transaction can make the pair atomic.
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
         Ok(())
     }
@@ -1435,15 +1479,8 @@ impl SessionBackend for SqliteSessionBackend {
 
     fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         let conn = self.conn.lock();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, trim_breadcrumb)
-             VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(session_key) DO UPDATE SET trim_breadcrumb = excluded.trim_breadcrumb",
-            params![session_key, now, now, i64::from(present)],
-        )
-        .map_err(std::io::Error::other)?;
-        Ok(())
+        Self::set_session_trim_breadcrumb_on(&conn, session_key, present)
+            .map_err(std::io::Error::other)
     }
 
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
@@ -2962,5 +2999,51 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+
+    #[test]
+    fn replace_conversation_state_is_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .unwrap();
+        backend.set_session_trim_breadcrumb("s1", false).unwrap();
+
+        // A trigger that fails the breadcrumb half of the write, so the call
+        // has to roll back the transcript half too if it is truly one
+        // transaction rather than two committed statements.
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER poison_trim_breadcrumb
+                 BEFORE UPDATE OF trim_breadcrumb ON session_metadata
+                 WHEN NEW.session_key = 's1'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated breadcrumb write failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let result = backend.replace_conversation_state(
+            "s1",
+            &[ChatMessage::user(
+                "replacement turn that must not land alone",
+            )],
+            true,
+        );
+        assert!(result.is_err(), "the poisoned trigger must fail the call");
+
+        // The transcript half must have rolled back with the breadcrumb
+        // half, not landed as a new transcript paired with the old flag.
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(false)
+        );
     }
 }

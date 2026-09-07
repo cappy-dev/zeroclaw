@@ -412,18 +412,32 @@ impl SessionBackend for SessionStore {
     ) -> std::io::Result<()> {
         // Hold the migration fence across both writes so a concurrent
         // migration cannot interleave, and the transcript+flag pair is not
-        // observed partially. Still not crash-atomic (two files) — a crash
-        // between the writes can leave them out of sync.
+        // observed partially. Two separate files still can't be made
+        // crash-atomic, so on a breadcrumb-write failure this rolls the
+        // transcript back to its pre-replace content instead of leaving a
+        // new transcript paired with a stale flag — a process that dies
+        // between the writes can still leave the pair split, but an
+        // in-process failure converges back to the last known-good state.
         let _guard = self.mutation_guard()?;
+        let previous_messages = self.load(session_key);
         self.rewrite(session_key, messages)?;
-        std::fs::write(
+        let breadcrumb_write = std::fs::write(
             self.trim_breadcrumb_path(session_key),
             if breadcrumb_present {
                 b"1" as &[u8]
             } else {
                 b"0"
             },
-        )
+        );
+        if let Err(e) = breadcrumb_write {
+            // Best-effort: if this rewrite also fails, the transcript is left
+            // at the new value with the stale flag, and the caller must
+            // reconcile by reloading both files rather than trusting either
+            // write succeeded.
+            let _ = self.rewrite(session_key, &previous_messages);
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
@@ -1121,5 +1135,42 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    #[test]
+    fn replace_conversation_state_rolls_back_transcript_when_breadcrumb_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .unwrap();
+        backend.set_session_trim_breadcrumb("s1", false).unwrap();
+
+        // Force the breadcrumb half of the write to fail by occupying its
+        // path with a directory: `fs::write` errors instead of replacing it.
+        let breadcrumb_path = store.trim_breadcrumb_path("s1");
+        std::fs::remove_file(&breadcrumb_path).unwrap();
+        std::fs::create_dir(&breadcrumb_path).unwrap();
+
+        let result = backend.replace_conversation_state(
+            "s1",
+            &[ChatMessage::user(
+                "replacement turn that must not land alone",
+            )],
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "the poisoned breadcrumb path must fail the call"
+        );
+
+        // The transcript must have rolled back to its pre-replace content,
+        // not the replacement that could never be paired with a committed
+        // flag.
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "pre-replace turn");
     }
 }
