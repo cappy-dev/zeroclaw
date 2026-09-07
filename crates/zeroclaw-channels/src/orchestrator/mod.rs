@@ -2368,7 +2368,19 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// Number of most-recent turns whose tool-result payloads are kept at full size
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+///
+/// Returns the resulting cached turns for `sender_key`, taken under the same
+/// lock that performed the append. A caller that needs to know exactly what
+/// its own turn observed (to reconcile a later wholesale replacement against
+/// concurrent same-sender writes, see `turns_appended_after`) must use this
+/// return value rather than a second, separately-locked read: a second read
+/// can observe another worker's write that raced in between, silently
+/// shifting what "this turn's own prefix" means.
+fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Vec<ChatMessage> {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
@@ -2407,6 +2419,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > max_history {
         turns.remove(0);
     }
+    turns.clone()
 }
 
 /// Return `retained_turns` with its last message's content replaced by
@@ -2430,6 +2443,35 @@ fn strip_volatile_preamble_before_persist(
     cleaned
 }
 
+/// Return the suffix of `live` that was appended after `known_prefix` was
+/// observed. Finds the longest suffix of `known_prefix` that still matches a
+/// prefix of `live` (by role and content) and returns whatever follows it in
+/// `live`. A same-sender cache is bounded and evicts from the front, so
+/// `known_prefix`'s own earliest messages can be rotated out of `live` by a
+/// concurrent worker's append without changing `live`'s length — comparing
+/// lengths alone cannot tell that rotation apart from no concurrent write at
+/// all, or from a concurrent write that also happened to bring the length
+/// back down. When no overlap is found at all (e.g. the whole prefix was
+/// evicted, or a concurrent `/new` reset replaced it), this returns the
+/// entire live slice: a duplicated turn is recoverable, a silently dropped
+/// one is not.
+fn turns_appended_after<'a>(
+    known_prefix: &[ChatMessage],
+    live: &'a [ChatMessage],
+) -> &'a [ChatMessage] {
+    let max_overlap = known_prefix.len().min(live.len());
+    let overlap = (0..=max_overlap)
+        .rev()
+        .find(|&n| {
+            known_prefix[known_prefix.len() - n..]
+                .iter()
+                .zip(&live[..n])
+                .all(|(a, b)| a.role == b.role && a.content == b.content)
+        })
+        .unwrap_or(0);
+    &live[overlap..]
+}
+
 /// Replace the cached and durable transcript for `sender_key` with
 /// `trimmed_turns` (the loop-owned history, still including the current
 /// user turn and any synthetic breadcrumb, minus the leading system
@@ -2443,14 +2485,19 @@ fn strip_volatile_preamble_before_persist(
 /// diverge. Callers append this turn's own new tool/assistant messages
 /// afterward, so this only resyncs the base the loop actually trimmed.
 ///
-/// `known_prefix_len` is the cache length this turn observed right after
-/// appending its own inbound message, before the tool loop ran. Without
-/// `interrupt_on_new_message`, another worker for the same `sender_key` can
-/// run concurrently and append its own complete turn under this same lock
-/// while this turn's loop is still in flight. If the live cache has grown
-/// past `known_prefix_len` by the time this call takes the lock, that
-/// worker's turns are appended after `trimmed_turns` instead of being
-/// silently discarded by a wholesale replace.
+/// `known_prefix` is the cache content this turn observed right after
+/// appending its own inbound message (via `append_sender_turn`'s return
+/// value), before the tool loop ran. Without `interrupt_on_new_message`,
+/// another worker for the same `sender_key` can run concurrently and append
+/// its own complete turn under this same lock while this turn's loop is
+/// still in flight. `turns_appended_after` finds whatever the live cache has
+/// beyond `known_prefix` — by content, not length — and that tail is
+/// appended after `trimmed_turns` instead of being silently discarded by a
+/// wholesale replace. A raw length comparison is not enough here: the cache
+/// is bounded by `max_history_messages` and evicts from the front, so a
+/// concurrent worker's append can rotate `known_prefix`'s own earliest
+/// messages out of the live cache without changing its length, or even
+/// shrinking it below `known_prefix.len()`.
 ///
 /// Returns `true` once the durable write (if any) has succeeded and the
 /// in-memory cache and `history_crumb_flags` now match the published state.
@@ -2467,7 +2514,7 @@ fn resync_sender_history_after_trim(
     sender_key: &str,
     trimmed_turns: &[ChatMessage],
     breadcrumb_present: bool,
-    known_prefix_len: usize,
+    known_prefix: &[ChatMessage],
     crumb_present_before_loop: bool,
 ) -> bool {
     let persist_lock = acquire_persist_lock(ctx, sender_key);
@@ -2479,10 +2526,8 @@ fn resync_sender_history_after_trim(
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(live) = histories.peek(sender_key)
-            && live.len() > known_prefix_len
-        {
-            published_turns.extend_from_slice(&live[known_prefix_len..]);
+        if let Some(live) = histories.peek(sender_key) {
+            published_turns.extend_from_slice(turns_appended_after(known_prefix, live));
         }
     }
 
@@ -6644,24 +6689,21 @@ async fn process_channel_message_body(
     // full content for every marker type so a later turn can re-load it.
     let timestamped_content =
         timestamped_channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
-    append_sender_turn(
+    // The returned snapshot is exactly what this turn's own append produced
+    // (including any race with a concurrent same-sender worker still in
+    // flight), taken under the same lock as the append itself. A separate,
+    // later read of the cache would risk observing a different worker's
+    // write that landed in between and silently shifting what "this turn's
+    // own prefix" means once the post-loop resync tries to reconcile against
+    // it (see `turns_appended_after`).
+    let known_prefix = append_sender_turn(
         ctx.as_ref(),
         &history_key,
         ChatMessage::user(&timestamped_content),
     );
 
     // Build history from per-sender conversation cache.
-    let prior_turns_raw = if force_fresh_session {
-        vec![ChatMessage::user(&timestamped_content)]
-    } else {
-        ctx.conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&history_key)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let mut prior_turns = normalize_cached_channel_turns(known_prefix.clone());
 
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
@@ -7610,7 +7652,7 @@ async fn process_channel_message_body(
             &history_key,
             &clean_retained_turns,
             history_has_trim_breadcrumb,
-            prior_turns_len_before_loop,
+            &known_prefix,
             crumb_present_before_loop,
         );
     }
@@ -14255,8 +14297,20 @@ fn channel_trim_resync_survives_restart() {
     // The tool-call loop trimmed its own working buffer: the two old turns
     // are gone and a breadcrumb was inserted ahead of the retained turn.
     let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    let known_prefix = [
+        dropped_turn.clone(),
+        dropped_reply.clone(),
+        retained_turn.clone(),
+    ];
     assert!(
-        resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true, 3, false),
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false
+        ),
         "resync must report success when the durable write succeeds"
     );
 
@@ -14399,8 +14453,16 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
     // The transcript write fails; this must not proceed to write a new
     // breadcrumb flag describing a transcript that was never committed, and
     // must not publish the trimmed cache either.
+    let known_prefix = [pre_trim_turn.clone()];
     assert!(
-        !resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true, 1, false),
+        !resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false
+        ),
         "resync must report failure when the durable transcript write fails"
     );
 
@@ -14486,7 +14548,7 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
 
     // Worker A observes this two-turn cache right after appending its own
     // inbound message, before its tool loop runs.
-    let known_prefix_len = 2;
+    let known_prefix = [dropped_turn.clone(), retained_turn.clone()];
 
     // Worker B, for the same sender, runs concurrently and completes a full
     // turn — its own inbound message plus the assistant's reply — through
@@ -14506,7 +14568,7 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
             &sender,
             &trimmed_turns,
             true,
-            known_prefix_len,
+            &known_prefix,
             false,
         ),
         "resync must report success when the durable write succeeds"
@@ -14530,6 +14592,107 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
         cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
         "the resync must append worker A's trimmed prefix ahead of worker B's turns, \
          not discard worker B's completed turn: got {cached:?}"
+    );
+
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the durable transcript must agree with the cache after the merge, \
+         so a restart does not lose worker B's turn either: got {reloaded:?}"
+    );
+}
+
+/// A bounded cache (`max_history_messages`) evicts from the front, so a
+/// concurrent worker's turns can rotate worker A's own observed prefix out of
+/// the cache without growing it past `known_prefix.len()` — the exact case a
+/// raw length comparison cannot distinguish from "nothing changed". With
+/// `max_history_messages = 2`, worker A observes `[old, A-user]`; worker B
+/// then appends its own user/reply pair, which evicts both of A's messages
+/// and leaves the cache at the same length (`2`) it was when A took its
+/// snapshot. A's resync must still preserve B's turns instead of discarding
+/// them because the length check saw no growth.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "concurrent_resync_eviction_test_key".to_string();
+
+    let old_turn = ChatMessage::user("old turn that predates worker A's own message");
+    let a_user = ChatMessage::user("worker A's own inbound message");
+    backend.append(&sender, &old_turn).expect("seed append");
+    backend.append(&sender, &a_user).expect("seed append");
+
+    let mut ctx = test_channel_ctx_with_backend(backend.clone());
+    Arc::get_mut(&mut ctx)
+        .expect("sole owner right after construction")
+        .agent_cfg = Arc::new({
+        let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        cfg.resolved.max_history_messages = 2;
+        cfg
+    });
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![old_turn.clone(), a_user.clone()]);
+
+    // Worker A observes this two-turn, at-cap cache right after appending its
+    // own inbound message, before its tool loop runs.
+    let known_prefix = [old_turn.clone(), a_user.clone()];
+
+    // Worker B, for the same sender, completes a full turn through the
+    // ordinary append path before worker A's resync takes the lock. Both
+    // appends evict from the front: the first evicts `old_turn`, the second
+    // evicts `a_user` — the live cache ends at length 2, identical to
+    // `known_prefix.len()`, even though neither of A's own messages survives.
+    let worker_b_user = ChatMessage::user("worker B's own inbound message");
+    let worker_b_reply = ChatMessage::assistant("worker B's completed reply");
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_user.clone());
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_reply.clone());
+
+    // Worker A's tool loop retained its own turn unchanged (nothing to trim
+    // at a two-message prefix), unaware that worker B already rotated it out
+    // of the shared cache.
+    let trimmed_turns = vec![a_user.clone()];
+    assert!(
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            false,
+            &known_prefix,
+            false,
+        ),
+        "resync must report success when the durable write succeeds"
+    );
+
+    let expected = [
+        a_user.clone(),
+        worker_b_user.clone(),
+        worker_b_reply.clone(),
+    ];
+
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "a cache rotation that coincidentally leaves the length unchanged must not let the \
+         resync discard worker B's completed turn: got {cached:?}"
     );
 
     let reloaded = backend.load(&sender);
