@@ -232,9 +232,15 @@ impl SessionStore {
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
     /// Also removes the breadcrumb sidecar: a reset session has no synthetic
     /// marker, so a stale recorded `true` must not survive into the next
-    /// first message and be mistaken for a real trim.
+    /// first message and be mistaken for a real trim. The sidecar is removed
+    /// even when the transcript is absent or not a regular JSONL file: it is
+    /// independently creatable by `set_trim_breadcrumb`, so a sidecar-only
+    /// state (e.g. after a transcript write failure or a prior cleanup that
+    /// removed the transcript but not its provenance file) must not survive
+    /// a `clear_messages` call and be misread by a later restore.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let _guard = self.mutation_guard()?;
+        let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
         if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
             return Ok(0);
         }
@@ -242,7 +248,6 @@ impl SessionStore {
         if count > 0 {
             self.rewrite(session_key, &[])?;
         }
-        let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
         Ok(count)
     }
 
@@ -1047,6 +1052,35 @@ mod tests {
         // behind either.
         store.set_trim_breadcrumb(key, true).unwrap();
         assert_eq!(store.clear_messages(key).unwrap(), 0);
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_removes_sidecar_only_breadcrumb_with_no_transcript_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "sidecar_only_crumb_test";
+
+        // No transcript file exists at all for this key (e.g. after a prior
+        // cleanup removed the transcript but not its sidecar), yet the
+        // sidecar is independently creatable.
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert!(!is_regular_jsonl_session_file(&store.session_path(key)));
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), Some(true));
+
+        assert_eq!(store.clear_messages(key).unwrap(), 0);
+        assert_eq!(
+            store.get_trim_breadcrumb(key).unwrap(),
+            None,
+            "a sidecar-only breadcrumb must not survive clear_messages just because \
+             there was no transcript file to early-return past"
+        );
+
+        // A session that later receives its first message must not inherit
+        // the stale flag and misclassify that message as post-trim.
+        store
+            .append(key, &ChatMessage::user("first message"))
+            .unwrap();
         assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
     }
 

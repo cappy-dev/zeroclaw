@@ -2507,8 +2507,13 @@ fn turns_appended_after<'a>(
 /// a breadcrumb sidecar write fails), so on failure this reloads whatever is
 /// actually durable now and publishes that to both the cache and
 /// `history_crumb_flags` — falling back to `crumb_present_before_loop` only
-/// when the backend has no breadcrumb recorded at all — rather than leaving
-/// the cache ahead of, or behind, the real durable state.
+/// when the backend reports the provenance was genuinely never recorded
+/// (`Ok(None)`). When the provenance read itself errors, this leaves the
+/// cache and flag exactly as they were before this call instead of pairing
+/// a possibly-incomplete transcript reload with a guessed flag: an unread
+/// provenance is not the same as a confirmed absence, and publishing a
+/// guess in its place could make a later trim treat a synthetic marker as
+/// a real turn or vice versa.
 fn resync_sender_history_after_trim(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -2552,23 +2557,43 @@ fn resync_sender_history_after_trim(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Failed to persist trimmed session history and breadcrumb provenance"
             );
-            let reloaded_turns = store.load(sender_key);
-            let reloaded_breadcrumb = store
-                .get_session_trim_breadcrumb(sender_key)
-                .ok()
-                .flatten()
-                .unwrap_or(crumb_present_before_loop);
-            let mut histories = ctx
-                .conversation_histories
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            histories.put(sender_key.to_string(), reloaded_turns);
-            drop(histories);
-            let mut flags = ctx
-                .history_crumb_flags
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            flags.put(sender_key.to_string(), reloaded_breadcrumb);
+            match store.get_session_trim_breadcrumb(sender_key) {
+                Ok(reloaded_breadcrumb) => {
+                    let reloaded_turns = store.load(sender_key);
+                    let reloaded_breadcrumb =
+                        reloaded_breadcrumb.unwrap_or(crumb_present_before_loop);
+                    let mut histories = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    histories.put(sender_key.to_string(), reloaded_turns);
+                    drop(histories);
+                    let mut flags = ctx
+                        .history_crumb_flags
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    flags.put(sender_key.to_string(), reloaded_breadcrumb);
+                }
+                Err(e) => {
+                    // The provenance read failed outright: `Err(_)` is not
+                    // `Ok(None)`, so treating it as a confirmed absence
+                    // could publish a guessed flag beside a transcript
+                    // reload that may itself be incomplete. Leave the cache
+                    // and flag untouched rather than claim reconciliation
+                    // that didn't happen; the next successful resync or a
+                    // fresh restart-time reload will reconcile once the
+                    // backend can be read again.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Failed to read trim breadcrumb provenance after a persistence \
+                         failure; leaving cached history and breadcrumb flag unreconciled \
+                         rather than publishing a guess"
+                    );
+                }
+            }
             return false;
         }
     }
@@ -14504,6 +14529,122 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
     assert!(
         same(&reloaded[0], &pre_trim_turn),
         "the pre-trim turn must survive the failed resync across a restart"
+    );
+}
+
+/// When `replace_conversation_state` fails and the subsequent provenance
+/// re-read also errors (rather than confirming the flag was never
+/// recorded), the resync must not collapse that error into `Ok(None)` and
+/// publish a guessed flag beside a transcript reload that may itself be
+/// incomplete. It must leave the cache and flag exactly as they were.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_does_not_guess_breadcrumb_when_provenance_read_fails() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    #[derive(Default)]
+    struct FailingRewriteAndProvenanceBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+    }
+    impl SessionBackend for FailingRewriteAndProvenanceBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, _messages: &[ChatMessage]) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated transcript write failure"))
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, _present: bool) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated breadcrumb write failure"))
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Err(std::io::Error::other(
+                "simulated breadcrumb provenance read failure",
+            ))
+        }
+    }
+
+    let sender = "trim_resync_provenance_failure_test_key".to_string();
+    let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+
+    let pre_trim_turn = ChatMessage::user("pre-trim turn that must survive the failed resync");
+    backend
+        .append(&sender, &pre_trim_turn)
+        .expect("seed pre-trim durable turn");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![pre_trim_turn.clone()]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), false);
+
+    let trimmed_turns = vec![
+        ChatMessage::system("(earlier history was trimmed)"),
+        ChatMessage::user("most recent turn"),
+    ];
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let known_prefix = [pre_trim_turn.clone()];
+    assert!(
+        !resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false
+        ),
+        "resync must report failure when the durable transcript write fails"
+    );
+
+    // Neither the cache nor the flag may change: an unread provenance is
+    // not a confirmed absence, so nothing here counts as reconciled.
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == 1 && same(&cached[0], &pre_trim_turn),
+        "the cache must stay exactly as it was before the failed resync, \
+         not be replaced by a reload paired with a guessed flag"
+    );
+    assert_eq!(
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .copied(),
+        Some(false),
+        "the flag must stay exactly as it was before the failed resync, \
+         not be overwritten with crumb_present_before_loop as if the \
+         backend had confirmed no breadcrumb was recorded"
     );
 }
 
