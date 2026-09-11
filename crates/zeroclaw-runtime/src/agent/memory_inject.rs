@@ -382,6 +382,21 @@ pub async fn render_memory_context(
     context
 }
 
+/// Strip a `render_memory_context` preamble off the front of `content`, if
+/// present. The preamble is provider-only per-turn context: it must never
+/// be persisted into durable/canonical history (trim write-back, session
+/// storage), only sent to the provider for the turn that recalled it.
+/// Returns `content` unchanged when no preamble is present.
+pub(crate) fn strip_memory_context_preamble(content: &str) -> &str {
+    let Some(after_open) = content.strip_prefix(MEMORY_CONTEXT_OPEN) else {
+        return content;
+    };
+    let Some(close_idx) = after_open.find(MEMORY_CONTEXT_CLOSE) else {
+        return content;
+    };
+    after_open[close_idx + MEMORY_CONTEXT_CLOSE.len()..].trim_start_matches('\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1636,6 +1651,30 @@ mod tests {
         memory.candidate_multiplier = 0;
         let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
         assert_eq!(cfg.candidate_multiplier, 1);
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_recovers_the_original_user_content() {
+        let existing = "what's the weather like";
+        let with_preamble = format!(
+            "{MEMORY_CONTEXT_OPEN}\n- k: some recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n{existing}"
+        );
+        assert_eq!(
+            strip_memory_context_preamble(&with_preamble),
+            existing,
+            "must recover exactly the pre-injection user content"
+        );
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_is_a_no_op_without_a_preamble() {
+        let plain = "no memory preamble here";
+        assert_eq!(strip_memory_context_preamble(plain), plain);
+
+        // An open marker with no matching close is left untouched rather
+        // than silently swallowing the rest of the message.
+        let unterminated = format!("{MEMORY_CONTEXT_OPEN}\nunterminated");
+        assert_eq!(strip_memory_context_preamble(&unterminated), unterminated);
     }
 
     /// Regression: a high-scoring but render-ineligible entry must not consume

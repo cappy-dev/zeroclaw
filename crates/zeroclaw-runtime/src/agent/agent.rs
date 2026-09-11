@@ -2412,7 +2412,20 @@ impl Agent {
                     continue;
                 }
             }
-            replayed.push(ConversationMessage::Chat(msg.clone()));
+            // The turn engine injects the recalled-memory preamble in place
+            // on the last user message (`turn::mod.rs`'s `memory` handling)
+            // for this turn's provider request only; it must never land in
+            // durable/canonical history, which every call site of this
+            // function feeds. Strip it before persisting — a no-op for any
+            // message that never carried the preamble.
+            let stripped = crate::agent::memory_inject::strip_memory_context_preamble(&msg.content);
+            if stripped.len() == msg.content.len() {
+                replayed.push(ConversationMessage::Chat(msg.clone()));
+            } else {
+                let mut msg = msg.clone();
+                msg.content = stripped.to_string();
+                replayed.push(ConversationMessage::Chat(msg));
+            }
         }
         replayed
     }
@@ -3521,6 +3534,36 @@ mod tests {
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    /// Regression: trim write-back must never persist the provider-only
+    /// recalled-memory preamble the turn engine injects onto the last user
+    /// message. `replay_loop_messages` feeds every durable-history write-back
+    /// call site, so stripping it there covers both the buffered and
+    /// streamed trim paths.
+    #[test]
+    fn replay_loop_messages_strips_the_memory_context_preamble() {
+        let with_preamble = ChatMessage::user(format!(
+            "{}\n- k: recalled fact\n{}\n\nwhat's the weather like",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        ));
+        let assistant = ChatMessage::assistant("it's sunny".to_string());
+        let replayed = Agent::replay_loop_messages(&[with_preamble, assistant]);
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(user_msg.content, "what's the weather like");
+        assert!(
+            !user_msg
+                .content
+                .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+            "durable history must never carry the recalled-memory preamble"
+        );
     }
 
     zeroclaw_api::mock_tool_attribution!(
