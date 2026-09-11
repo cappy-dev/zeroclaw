@@ -3832,12 +3832,14 @@ mod reported_budget_tests {
         // when the raw marker-only estimate looks small.
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // Minimal PNG signature — enough for MIME detection.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        // PNG signature plus padding: MIME detection only needs the
+        // extension, but the padding keeps the base64 expansion larger than
+        // the marker's own path text regardless of how long the platform's
+        // temp-dir path is (a bare 8-byte signature can lose that race on
+        // Windows CI runners, whose temp paths run longer than Linux's).
+        let mut fake_png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        fake_png.extend(vec![0u8; 4096]);
+        std::fs::write(&image_path, &fake_png).unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
         let big = "x".repeat(2000);
         let mut history = vec![
