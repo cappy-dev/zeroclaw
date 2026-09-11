@@ -2612,6 +2612,81 @@ fn resync_sender_history_after_trim(
     true
 }
 
+/// Resync the cache and durable transcript to the tool-call loop's trimmed
+/// `history` working buffer when the loop changed the breadcrumb or dropped
+/// prior turns, and report whether that resync could be confirmed.
+///
+/// `history_crumb_flags` is written here rather than unconditionally ahead
+/// of this check: `resync_sender_history_after_trim` owns that write on the
+/// resync path (including the failure fallback described on its own doc
+/// comment), and writing it ahead of the check would overwrite the pre-trim
+/// value that failure fallback relies on to decide whether the backend
+/// genuinely never recorded provenance. When nothing was trimmed, this is
+/// the sole writer of the flag.
+///
+/// Returns `true` when a resync was attempted and could not be confirmed
+/// reconciled. Callers must not append this turn's own new messages on top
+/// of the cache in that case: this function has already evicted the cache
+/// entry for `sender_key`, so a caller that appended anyway would just
+/// recreate an unreconciled entry from its own working buffer instead of
+/// letting the next turn reload from the backend.
+#[allow(clippy::too_many_arguments)]
+fn resync_history_after_trim_or_evict_cache(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    history: &[ChatMessage],
+    history_has_trim_breadcrumb: bool,
+    crumb_present_before_loop: bool,
+    prior_turns_len_before_loop: usize,
+    known_prefix: &[ChatMessage],
+    outgoing_user_turn_raw_content: Option<&str>,
+) -> bool {
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let retained_prior_turns = if last_user_idx >= 1 {
+        &history[1..=last_user_idx]
+    } else {
+        &history[1..1]
+    };
+
+    if history_has_trim_breadcrumb == crumb_present_before_loop
+        && retained_prior_turns.len() == prior_turns_len_before_loop
+    {
+        let mut flags = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flags.put(sender_key.to_string(), history_has_trim_breadcrumb);
+        return false;
+    }
+
+    let clean_retained_turns = strip_volatile_preamble_before_persist(
+        retained_prior_turns,
+        outgoing_user_turn_raw_content,
+    );
+    let reconciled = resync_sender_history_after_trim(
+        ctx,
+        sender_key,
+        &clean_retained_turns,
+        history_has_trim_breadcrumb,
+        known_prefix,
+        crumb_present_before_loop,
+    );
+    if !reconciled {
+        // The resync could not confirm that the cache matches whatever
+        // ended up durable (e.g. a partially applied replacement whose
+        // provenance re-read then also failed). Evict the cache entry
+        // instead of leaving it in place: the next turn for this sender
+        // reloads from the backend rather than extending a cache this
+        // turn can no longer vouch for.
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.pop(sender_key);
+    }
+    !reconciled
+}
+
 /// Extract tool-call (assistant with tool_call content) and tool-result
 /// messages from the current turn in the LLM history, excluding the final
 /// assistant text response.  "Current turn" = everything after the last
@@ -7637,50 +7712,16 @@ async fn process_channel_message_body(
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
     // `Drop` path supplies the same matched end on panic or early unwind.
-    // Persist breadcrumb flag for next restore so a synthetic crumb is not
-    // re-inferred from user-controlled text. This must happen before the
-    // history is persisted via append_sender_turn.
-    {
-        let mut flags = ctx
-            .history_crumb_flags
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        flags.put(history_key.clone(), history_has_trim_breadcrumb);
-    }
-
-    // The tool-call loop may have dropped whole turns and/or inserted a
-    // breadcrumb directly on its `history` working buffer to fit the
-    // configured token budget. When that happened, the cached and durable
-    // transcript must be resynced to the loop's own trimmed prefix before
-    // this turn's new tool/assistant messages are appended below — otherwise
-    // the next message reloads the dropped turns from the stale cache while
-    // `history_crumb_flags` says the transcript already has a breadcrumb.
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
-    let retained_prior_turns = if last_user_idx >= 1 {
-        &history[1..=last_user_idx]
-    } else {
-        &history[1..1]
-    };
-    if history_has_trim_breadcrumb != crumb_present_before_loop
-        || retained_prior_turns.len() != prior_turns_len_before_loop
-    {
-        let clean_retained_turns = strip_volatile_preamble_before_persist(
-            retained_prior_turns,
-            outgoing_user_turn_raw_content.as_deref(),
-        );
-        // `resync_sender_history_after_trim` reconciles both the cache and
-        // `history_crumb_flags` to whatever ends up durable: the intended
-        // trimmed state on success, or a reload of the backend's actual
-        // current state on failure. Nothing further to revert here.
-        resync_sender_history_after_trim(
-            ctx.as_ref(),
-            &history_key,
-            &clean_retained_turns,
-            history_has_trim_breadcrumb,
-            &known_prefix,
-            crumb_present_before_loop,
-        );
-    }
+    let history_resync_failed = resync_history_after_trim_or_evict_cache(
+        ctx.as_ref(),
+        &history_key,
+        &history,
+        history_has_trim_breadcrumb,
+        crumb_present_before_loop,
+        prior_turns_len_before_loop,
+        &known_prefix,
+        outgoing_user_turn_raw_content.as_deref(),
+    );
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
         let usage = ctx.snapshot_turn_usage();
@@ -7879,8 +7920,15 @@ async fn process_channel_message_body(
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
             // context, preventing drift toward tool-less responses.
+            //
+            // Skipped when the pre-trim resync above could not confirm the
+            // cache matches what's durable: appending onto an evicted cache
+            // would just recreate an unreconciled entry from this turn's
+            // own working buffer. The reply is still delivered to the user
+            // below; only this turn's contribution to the stored transcript
+            // is dropped, and the next turn reloads from the backend.
             let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
-            if keep_tool_turns > 0 {
+            if !history_resync_failed && keep_tool_turns > 0 {
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
                 // assistant response that matches our delivered text.
@@ -7891,11 +7939,13 @@ async fn process_channel_message_body(
             }
 
             let history_response = delivered_response.clone();
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
+            if !history_resync_failed {
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+            }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
@@ -14645,6 +14695,123 @@ fn channel_trim_resync_does_not_guess_breadcrumb_when_provenance_read_fails() {
         "the flag must stay exactly as it was before the failed resync, \
          not be overwritten with crumb_present_before_loop as if the \
          backend had confirmed no breadcrumb was recorded"
+    );
+}
+
+/// Caller-level regression for the same failure as
+/// `channel_trim_resync_does_not_guess_breadcrumb_when_provenance_read_fails`,
+/// but exercised through `resync_history_after_trim_or_evict_cache` — the
+/// function the message-handling caller actually calls. A prior version of
+/// that caller wrote `history_crumb_flags` unconditionally before this
+/// check and ignored the resync's return value, so a failed resync left a
+/// stale cache paired with a flag describing the unconfirmed trimmed state.
+/// This asserts the caller-facing contract instead: report failure, and
+/// leave no stale cache entry for a later append to build on.
+#[cfg(test)]
+#[test]
+fn caller_evicts_cache_and_does_not_guess_flag_when_trim_resync_fails() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    #[derive(Default)]
+    struct FailingRewriteAndProvenanceBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+    }
+    impl SessionBackend for FailingRewriteAndProvenanceBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, _messages: &[ChatMessage]) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated transcript write failure"))
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, _present: bool) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated breadcrumb write failure"))
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Err(std::io::Error::other(
+                "simulated breadcrumb provenance read failure",
+            ))
+        }
+    }
+
+    let sender = "caller_trim_resync_provenance_failure_test_key".to_string();
+    let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+
+    let pre_trim_turn = ChatMessage::user("pre-trim turn that must survive the failed resync");
+    backend
+        .append(&sender, &pre_trim_turn)
+        .expect("seed pre-trim durable turn");
+
+    let ctx = test_channel_ctx_with_backend(backend as Arc<dyn SessionBackend>);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![pre_trim_turn.clone()]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), false);
+
+    // The loop's working buffer: a breadcrumb was inserted and the older
+    // turn was dropped, which is exactly what makes the caller decide a
+    // resync is needed.
+    let loop_history = vec![
+        ChatMessage::system("system prompt"),
+        ChatMessage::system("(earlier history was trimmed)"),
+        ChatMessage::user("most recent turn"),
+    ];
+    let known_prefix = [pre_trim_turn.clone()];
+
+    let resync_failed = resync_history_after_trim_or_evict_cache(
+        ctx.as_ref(),
+        &sender,
+        &loop_history,
+        true,  // history_has_trim_breadcrumb
+        false, // crumb_present_before_loop
+        1,     // prior_turns_len_before_loop
+        &known_prefix,
+        None,
+    );
+
+    assert!(
+        resync_failed,
+        "the caller must be told the resync could not be confirmed"
+    );
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "a failed resync must evict the cache entry rather than leave a stale \
+         one for the caller to append this turn's own messages onto"
+    );
+    assert_eq!(
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .copied(),
+        Some(false),
+        "the flag must not be published as a guessed pair alongside the \
+         unconfirmed cache state"
     );
 }
 
