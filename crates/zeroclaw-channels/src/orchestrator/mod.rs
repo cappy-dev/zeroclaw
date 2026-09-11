@@ -8295,7 +8295,14 @@ async fn process_channel_message_body(
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
-                if !rolled_back {
+                // Mirror the successful-response path: when the pre-trim
+                // resync above could not confirm the cache matches what's
+                // durable, `rollback_orphan_user_turn` already declines
+                // (returns false) rather than mutate an unreconciled cache.
+                // Appending here regardless would recreate exactly the cache
+                // entry the resync failure was trying to avoid, from this
+                // turn's own unverified working buffer.
+                if !rolled_back && !history_resync_failed {
                     // Close the orphan user turn so subsequent messages don't
                     // inherit this failed request as unfinished context.
                     append_sender_turn(
@@ -8344,12 +8351,19 @@ async fn process_channel_message_body(
                 started_at.elapsed().as_millis()
             );
             // Close the orphan user turn so subsequent messages don't
-            // inherit this timed-out request as unfinished context.
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
+            // inherit this timed-out request as unfinished context. Skipped
+            // when the pre-trim resync above could not confirm the cache
+            // matches what's durable — same rationale as the error path
+            // above and the successful-response path's tool/assistant
+            // append: appending here would recreate an unreconciled cache
+            // entry from this turn's own unverified working buffer.
+            if !history_resync_failed {
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                );
+            }
             if let Some(channel) = target_channel.as_ref() {
                 // Localized error text (master) delivered with suppress_voice
                 // (RFCerror-path fix): cancel the draft, then send as
@@ -14259,6 +14273,108 @@ fn test_channel_ctx_with_backend(
         pacing: zeroclaw_config::schema::PacingConfig::default(),
         max_tool_result_chars: 0,
         context_token_budget: 0,
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+            std::time::Duration::ZERO,
+        )),
+        receipt_generator: None,
+        show_receipts_in_response: false,
+        last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        runtime_defaults_override: Arc::new(Mutex::new(None)),
+        persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        sop_engine: None,
+        sop_audit: None,
+    })
+}
+
+/// Like [`test_channel_ctx_with_backend`], but also wires a real channel and
+/// model provider so `process_channel_message`'s full error/timeout paths
+/// (not just the isolated resync helpers) can be exercised end to end
+/// against a forced-failing durable backend. `context_token_budget` lets a
+/// caller force the pre-dispatch gate to drop a whole turn locally, before
+/// any provider round trip, so the resync-failure path can be reached
+/// without needing a real provider-reported budget.
+#[cfg(test)]
+fn test_channel_ctx_with_backend_channel_and_provider(
+    backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+    channel: Arc<dyn Channel>,
+    model_provider: Arc<dyn ModelProvider>,
+    context_token_budget: usize,
+) -> Arc<ChannelRuntimeContext> {
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(channels_by_name),
+        model_provider,
+        model_provider_ref: Arc::new("test".into()),
+        agent_alias: Arc::new("test".into()),
+        agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+        memory: Arc::new(tests::NoopMemory),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::new(tests::NoopMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
+        tools_registry: Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+        ),
+        observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+        system_prompt: Arc::new(String::new()),
+        model: Arc::new("test".into()),
+        temperature: Some(0.0),
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                .expect("MAX_CONVERSATION_SENDERS must be positive"),
+        ))),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+        scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+        reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        },
+        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+        agent_transcription_provider: String::new(),
+        hooks: None,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: Some(backend),
+        approval_manager: Arc::new(
+            zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            ),
+        ),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: zeroclaw_config::schema::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget,
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             std::time::Duration::ZERO,
         )),
@@ -20323,6 +20439,124 @@ api_key = "anthropic-key"
             "brackets must share a turn_id even on error"
         );
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
+    }
+
+    /// Regression: a provider error must not recreate the channel cache from
+    /// this turn's own unverified working buffer when the pre-trim resync
+    /// above could not confirm the durable transcript matches it. Mirrors
+    /// the successful-response path's existing `!history_resync_failed`
+    /// guard on the tool/assistant appends.
+    #[tokio::test]
+    async fn process_channel_message_does_not_recreate_cache_after_provider_error_and_failed_resync()
+     {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        #[derive(Default)]
+        struct FailingRewriteAndProvenanceBackend {
+            messages: std::sync::Mutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for FailingRewriteAndProvenanceBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            }
+            fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(msg.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                vec![]
+            }
+            fn rewrite_messages(
+                &self,
+                _key: &str,
+                _messages: &[ChatMessage],
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated transcript write failure"))
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                _key: &str,
+                _present: bool,
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated breadcrumb write failure"))
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other(
+                    "simulated breadcrumb provenance read failure",
+                ))
+            }
+        }
+
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+        let history_key = conversation_history_key(&msg);
+
+        let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+        // A whole old turn (user + assistant), so a tiny `context_token_budget`
+        // forces the pre-dispatch gate to drop it before the (erroring)
+        // provider call, giving the resync below something real to detect.
+        let old_user_turn =
+            ChatMessage::user("pre-existing turn that must survive a failed resync");
+        let old_assistant_turn = ChatMessage::assistant("pre-existing reply".to_string());
+        for turn in [&old_user_turn, &old_assistant_turn] {
+            backend
+                .append(&history_key, turn)
+                .expect("seed pre-existing durable turn");
+        }
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone() as Arc<dyn SessionBackend>,
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            1, // context_token_budget: force a whole-turn drop pre-dispatch
+        );
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                history_key.clone(),
+                vec![old_user_turn.clone(), old_assistant_turn.clone()],
+            );
+        runtime_ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(history_key.clone(), false);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        assert!(
+            !backend
+                .messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|m| m.content.contains("Task failed")),
+            "a provider error after a failed resync must not append the \
+             failure marker onto an unreconciled durable transcript"
+        );
+        assert!(
+            runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&history_key)
+                .is_none(),
+            "the failed resync must have evicted the cache entry, and the \
+             error path must not have recreated it"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
